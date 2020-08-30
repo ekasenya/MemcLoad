@@ -42,20 +42,6 @@ def dot_rename(path):
     os.rename(path, os.path.join(head, "." + fn))
 
 
-def remove_dot_rename(path):
-    head, fn = os.path.split(path)
-    # atomic in most cases
-    if fn and fn[0] == '.':
-        os.rename(path, os.path.join(head, fn[1:]))
-
-
-def remove_dot_from_files(pattern):
-    head, fn = os.path.split(pattern)
-    pattern = os.path.join(head, '.' + fn)
-    for fn in glob.iglob(pattern):
-        remove_dot_rename(fn)
-
-
 # Multi-process strategy
 
 class MemcachedWorker(threading.Thread):
