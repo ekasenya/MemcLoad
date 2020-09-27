@@ -22,6 +22,7 @@ import memcache
 NORMAL_ERR_RATE = 0.01
 MAX_RETRY_ATTEMPTS = 5
 MEMCACHED_TIMEOUT = 10
+CHUNK_SIZE = 3
 
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
@@ -58,6 +59,7 @@ class MemcachedWorker(threading.Thread):
         self.results = results
 
     def run(self):
+        chunk = {}
         while True:
             values = self.task_queue.get()
             if values == 'quit':
@@ -70,37 +72,49 @@ class MemcachedWorker(threading.Thread):
                     self.errors += 1
                     continue
 
-                if self.insert_appsinstalled(appsinstalled):
+                ua = self.make_ua(appsinstalled)
+                key = "{}:{}".format(appsinstalled.dev_type, appsinstalled.dev_id)
+
+                if self.dry:
+                    logging.debug("{} - {} -> {}".format(self.memc_addr, key, str(ua).replace("\n", " ")))
                     self.processed += 1
-                else:
-                    self.errors += 1
+                    continue
+
+                chunk[key] = ua.SerializeToString()
+
+                if len(chunk) >= CHUNK_SIZE:
+                    if self.insert_memcache(chunk):
+                        self.processed += len(chunk)
+                    else:
+                        self.errors += len(chunk)
+                    chunk.clear()
             except Exception:
                 self.errors += 1
             self.task_queue.task_done()
 
+        if chunk:
+            if self.insert_memcache(chunk):
+                self.processed += len(chunk)
+            else:
+                self.errors += len(chunk)
+
         self.results.put((self.processed, self.errors))
 
-    def insert_appsinstalled(self, appsinstalled):
+    def make_ua(self, appsinstalled):
         ua = appsinstalled_pb2.UserApps()
         ua.lat = appsinstalled.lat
         ua.lon = appsinstalled.lon
-        key = "{}:{}".format(appsinstalled.dev_type, appsinstalled.dev_id)
         ua.apps.extend(appsinstalled.apps)
-        packed = ua.SerializeToString()
 
-        if self.dry:
-            logging.debug("{} - {} -> {}".format(self.memc_addr, key, str(ua).replace("\n", " ")))
-            return True
-        else:
-            return self.insert_memcache(key, packed)
+        return ua
 
-    def insert_memcache(self, key, packed):
+    def insert_memcache(self, appsinstalled_dict):
         try:
             if not self.memc_client:
                 self.memc_client = memcache.Client([self.memc_addr], socket_timeout=MEMCACHED_TIMEOUT)
             for attempt_num in range(MAX_RETRY_ATTEMPTS):
                 try:
-                    self.memc_client.set(key, packed)
+                    self.memc_client.set_multi(appsinstalled_dict)
                 except Exception:
                     if attempt_num == MAX_RETRY_ATTEMPTS - 1:
                         raise
@@ -118,6 +132,25 @@ def multiprocess_strategy(options, device_memc):
     for path in pool.map(partial(multithread_process_file, options=options, device_memc=device_memc),
                          [fn for fn in glob.iglob(options.pattern)]):
         dot_rename(path)
+
+
+def parse_appsinstalled(line):
+    line_parts = line.strip().split("\t")
+    if len(line_parts) < 5:
+        return
+    dev_type, dev_id, lat, lon, raw_apps = line_parts
+    if not dev_type or not dev_id:
+        return
+    try:
+        apps = [int(a.strip()) for a in raw_apps.split(",")]
+    except ValueError:
+        apps = [int(a.strip()) for a in raw_apps.split(",") if a.isidigit()]
+        logging.info("Not all user apps are digits: `%s`" % line)
+    try:
+        lat, lon = float(lat), float(lon)
+    except ValueError:
+        logging.info("Invalid geo coords: `%s`" % line)
+    return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
 def multithread_process_file(fn, options, device_memc):
