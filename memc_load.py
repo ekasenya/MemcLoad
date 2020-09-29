@@ -22,7 +22,7 @@ import memcache
 NORMAL_ERR_RATE = 0.01
 MAX_RETRY_ATTEMPTS = 5
 MEMCACHED_TIMEOUT = 10
-CHUNK_SIZE = 3
+CHUNK_SIZE = 50
 
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
@@ -59,54 +59,30 @@ class MemcachedWorker(threading.Thread):
         self.results = results
 
     def run(self):
-        chunk = {}
         while True:
             values = self.task_queue.get()
             if values == 'quit':
                 break
 
             try:
-                dev_type, dev_id, lat, lon, apps = values
-                appsinstalled = AppsInstalled(dev_type, dev_id, lat, lon, apps)
-                if not appsinstalled:
-                    self.errors += 1
-                    continue
-
-                ua = self.make_ua(appsinstalled)
-                key = "{}:{}".format(appsinstalled.dev_type, appsinstalled.dev_id)
-
                 if self.dry:
-                    logging.debug("{} - {} -> {}".format(self.memc_addr, key, str(ua).replace("\n", " ")))
-                    self.processed += 1
+                    for key, packed in values.items():
+                        unpacked = appsinstalled_pb2.UserApps()
+                        unpacked.ParseFromString(packed)
+                        logging.debug("{} - {} -> {}".format(self.memc_addr, key, str(unpacked).replace("\n", " ")))
+                        self.processed += 1
                     continue
 
-                chunk[key] = ua.SerializeToString()
+                if self.insert_memcache(values):
+                    self.processed += len(values)
+                else:
+                    self.errors += len(values)
 
-                if len(chunk) >= CHUNK_SIZE:
-                    if self.insert_memcache(chunk):
-                        self.processed += len(chunk)
-                    else:
-                        self.errors += len(chunk)
-                    chunk.clear()
             except Exception:
-                self.errors += 1
+                self.errors += len(values)
             self.task_queue.task_done()
 
-        if chunk:
-            if self.insert_memcache(chunk):
-                self.processed += len(chunk)
-            else:
-                self.errors += len(chunk)
-
         self.results.put((self.processed, self.errors))
-
-    def make_ua(self, appsinstalled):
-        ua = appsinstalled_pb2.UserApps()
-        ua.lat = appsinstalled.lat
-        ua.lon = appsinstalled.lon
-        ua.apps.extend(appsinstalled.apps)
-
-        return ua
 
     def insert_memcache(self, appsinstalled_dict):
         try:
@@ -153,17 +129,29 @@ def parse_appsinstalled(line):
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
+def make_ua(appsinstalled):
+    ua = appsinstalled_pb2.UserApps()
+    ua.lat = appsinstalled.lat
+    ua.lon = appsinstalled.lon
+    ua.apps.extend(appsinstalled.apps)
+
+    return ua
+
+
 def multithread_process_file(fn, options, device_memc):
     processed = errors = 0
     workers = []
     results = Queue()
     task_queue_list = {}
 
+    record_buf = {}
+
     for memc_addr in device_memc.values():
         task_queue = Queue()
         worker = MemcachedWorker(memc_addr, task_queue, results, options.dry)
         workers.append(worker)
         task_queue_list[memc_addr] = task_queue
+        record_buf[memc_addr] = {}
         worker.start()
 
     logging.info('Processing {}'.format(fn))
@@ -183,10 +171,17 @@ def multithread_process_file(fn, options, device_memc):
             logging.error("{}. Unknown device type: {}".format(fn, appsinstalled.dev_type))
             continue
 
-        task_queue_list[memc_addr].put((appsinstalled.dev_type, appsinstalled.dev_id, appsinstalled.lat,
-                                        appsinstalled.lon, appsinstalled.apps))
+        ua = make_ua(appsinstalled)
+        key = "{}:{}".format(appsinstalled.dev_type, appsinstalled.dev_id)
+        record_buf[memc_addr][key] = ua.SerializeToString()
 
-    for task_queue in task_queue_list.values():
+        if len(record_buf[memc_addr]) >= CHUNK_SIZE:
+            task_queue_list[memc_addr].put(record_buf[memc_addr])
+            record_buf[memc_addr] = {}
+
+    for memc_addr, task_queue in task_queue_list.items():
+        if len(record_buf[memc_addr]) > 0:
+            task_queue_list[memc_addr].put(record_buf[memc_addr])
         task_queue.put('quit')
 
     for worker in workers:
